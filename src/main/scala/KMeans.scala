@@ -8,6 +8,8 @@ import geotrellis.raster.render.ColorRamps
 import geotrellis.vector.{Extent, ProjectedExtent}
 import org.apache.spark.rdd.RDD
 import Utils._
+import geotrellis.spark.stitch.TileLayoutStitcher
+import geotrellis.spark.tiling.LayoutDefinition
 import org.apache.avro.generic.GenericData.StringType
 import org.apache.spark
 import org.apache.spark.ml.linalg.Vectors
@@ -29,9 +31,9 @@ import org.apache.spark.sql.types.{BinaryType, StructField, StructType}
 //7. Reconstruct the image using your predefined index
 
 object KMeans {
-//  add the index of the tile to the output sequence
-//  why am I doing this? don't I end up with only one feature vector anyway?
-//  maybe for reconstruction
+  val TILE_SIZE = 256
+
+  //Making a tuple with all the info that I need
   def tilesToKeyPx(pe: ProjectedExtent, t1: (Tile), t2: (Tile), t3: (Tile)) = {
     for {
       r <- 0 until t1.rows
@@ -42,7 +44,9 @@ object KMeans {
           //r, t1.get(c, r), t2.get(c, r), t3.get(c, r))
   }
 
+  //Function for expanding the inconveniently zipped tuple of tiles
   def expandTuple(t: ((Tile, Tile), Tile)) = (t._1._1,  t._1._2, t._2)
+
   def main(args: Array[String]): Unit = {
     val conf = new SparkConf().setMaster("local[*]").setAppName("IrisSpark")
     val sparkSession = SparkSession.builder
@@ -53,24 +57,23 @@ object KMeans {
     import sparkSession.implicits._
 
     val sc = sparkSession.sparkContext
-    val blueTIF: RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF")
-    val greenTIF: RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B3.TIF")
-    val redTIF : RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B4.TIF")
-    val blue: RDD[(ProjectedExtent, Tile)] = blueTIF
-      .split(256, 256)
-    val green: RDD[(ProjectedExtent, Tile)] = greenTIF
-      .split(256, 256)
-    val red: RDD[(ProjectedExtent, Tile)] = redTIF
-      .split(256, 256)
+    // imports a TIF and then splits it
+    def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath).split(TILE_SIZE, TILE_SIZE)
 
-    val peRDD = (blue.zip(green).zip(red))
-    val expandRDD = peRDD.map{
-      case((t1,t2),t3) => (t1, t2, t3)
-    }
+    val tifExtent = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF").first()._1.extent
 
-    val tupleRDD = expandRDD.flatMap{ case ((pe1: ProjectedExtent, value1: Tile),
+    val blue: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF")
+    val green: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B3.TIF")
+    val red: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B4.TIF")
+
+    //create a multi-band tuple
+    val expandRDD = (blue.zip(green).zip(red))
+        .map { case((t1,t2),t3) => (t1, t2, t3) }
+
+    val tupleRDD = expandRDD.flatMap { case ((pe1: ProjectedExtent, value1: Tile),
     (pe2: ProjectedExtent, value2: Tile),
-    (pe3: ProjectedExtent, value3: Tile)) => tilesToKeyPx(pe1, value1, value2, value3) }
+    (pe3: ProjectedExtent, value3: Tile)) => tilesToKeyPx(pe1, value1, value2, value3) 
+    }
     val df = tupleRDD.toDF("pe", "col", "row", "features").repartition(200)
     //val schemaString = "Col Row"
       //"Tile1 Tile2 Tile3"
@@ -92,18 +95,51 @@ object KMeans {
 
     //take a sequence and make it into an array
     def iterArray(seq: Seq[(Extent, Int, Int, Double)]): Array[Double] = {
-      val valArr = Array.ofDim[Double](65025)
-      for(i: Int <- 0 until 65025)
+      val valArr = Array.ofDim[Double](TILE_SIZE * TILE_SIZE)
+      for(i: Int <- 0 until (TILE_SIZE * TILE_SIZE))
         valArr(i) = seq.apply(i)._4
       valArr
     }
 
+    //grabs what we need out of the dataFrame
     val predsRDD = preds.select("pe", "col", "row", "prediction")
       .as[(Extent, Int, Int, Double)].rdd
       .groupBy(_._1)
-    val arrRDD = predsRDD.map(value => (value._1, iterArray(value._2.toSeq)))
-    val arrTile = arrRDD.map(pair => (pair._1, ArrayTile(pair._2, 255, 255)))
-    println(arrTile.first()._2.cols)
-    println(arrTile.first()._2.rows)
+
+    //creates an RDD with an array in it
+    val arrRDD = predsRDD
+      .map(value => (value._1, iterArray(value._2.toSeq)))
+
+    /** This takes care of packing a tile. */
+    val makeTile = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, TILE_SIZE, TILE_SIZE))
+
+    //The number of tiles in each direction. In this case, 30
+    val NUMBER_OF_TILES = 30
+
+    val tl = TileLayout(NUMBER_OF_TILES, NUMBER_OF_TILES, TILE_SIZE, TILE_SIZE)
+    val layout = LayoutDefinition(tifExtent, tl)
+
+    //Assigns the tiles 2D indexes based on position relative to the larger extent
+    def indexTile(pair: (Extent, Tile)): ((Int, Int), Tile) = {
+      val gridBounds = layout.mapTransform(pair._1)
+      println(gridBounds)
+      ((gridBounds.colMin, gridBounds.colMax), pair._2)
+    }
+
+    //performs transformations before the stitcher
+    val arrTile = arrRDD
+      .map(makeTile)
+      .map(indexTile)
+      .toLocalIterator
+      .toSeq
+
+    //Stitches the tiles together
+    val stitchTile = TileLayoutStitcher.stitch[Tile](arrTile)
+    println(stitchTile._1.cols)
+    println(stitchTile._1.rows)
+
+    //val stitchTile = layout.mapTransform({???}: Extent)
+
+    //arrTile.head._2.renderPng(ColorRamps.HeatmapBlueToYellowToRedSpectrum).write(s"//Users/jnachbar/Documents/Pictures/tileOne.png")
   }
 }
