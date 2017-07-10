@@ -31,7 +31,7 @@ import org.apache.spark.sql.types.{BinaryType, StructField, StructType}
 //7. Reconstruct the image using your predefined index
 
 object KMeans {
-  val TILE_SIZE = 256
+  val TILE_SIZE = 512
 
   //Making a tuple with all the info that I need
   def tilesToKeyPx(pe: ProjectedExtent, t1: (Tile), t2: (Tile), t3: (Tile)) = {
@@ -60,7 +60,9 @@ object KMeans {
     // imports a TIF and then splits it
     def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath).split(TILE_SIZE, TILE_SIZE)
 
-    val tifExtent = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF").first()._1.extent
+    val tif = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF").first()
+    println(math.ceil(tif._2.cols / TILE_SIZE))
+    println(math.ceil(tif._2.rows / TILE_SIZE))
 
     val blue: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF")
     val green: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B3.TIF")
@@ -72,39 +74,38 @@ object KMeans {
 
     val tupleRDD = expandRDD.flatMap { case ((pe1: ProjectedExtent, value1: Tile),
     (pe2: ProjectedExtent, value2: Tile),
-    (pe3: ProjectedExtent, value3: Tile)) => tilesToKeyPx(pe1, value1, value2, value3) 
+    (pe3: ProjectedExtent, value3: Tile)) => tilesToKeyPx(pe1, value1, value2, value3)
     }
-    val df = tupleRDD.toDF("pe", "col", "row", "features").repartition(200)
-    //val schemaString = "Col Row"
-      //"Tile1 Tile2 Tile3"
-    //val labels = schemaString.split(" ").map(name => StructField(name, types.IntegerType, nullable = true))
-    //val schema = StructType(labels)
-    //make it so that I go through every tuple, not just every sequence
-    //val rowSeq = tupleRDD.first().map(sequence => (sequence._1, sequence._2))
-    //val rowRDD = sc.parallelize(rowSeq.map(value => Row(value._1, value._2)))
-      //sequence.apply(2), sequence.apply(3),
-      //sequence.apply(4), sequence.apply(5)))
-    //val rawData = sparkSession.createDataFrame(rowRDD, schema)
-    //rawData.show(5)
+
+    val df = tupleRDD.toDF("pe", "col", "row", "features").repartition(200).toDF()
+
     //create function to explode tiles into pixel/key pairs
     val kmeans = new KMeans().setFeaturesCol("features").setK(6)
     val model = kmeans.fit(df)
     val preds = model.transform(df)
-    preds.groupBy("prediction").count().show()
+    //preds.groupBy("prediction").count().show()
     //start with an RDD with partitions based on one of the 900 possible extents
 
     //take a sequence and make it into an array
+
     def iterArray(seq: Seq[(Extent, Int, Int, Double)]): Array[Double] = {
-      val valArr = Array.ofDim[Double](TILE_SIZE * TILE_SIZE)
-      for(i: Int <- 0 until (TILE_SIZE * TILE_SIZE))
+      val valArr = Array.ofDim[Double](seq.length)
+      for(i: Int <- 0 until seq.length)
+        //this line must be changed to avoid indexOutOfBounds
         valArr(i) = seq.apply(i)._4
       valArr
     }
 
     //grabs what we need out of the dataFrame
+    //somehow sort this to be in order
+    //rows + columns - max
+    val distance = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, TILE_SIZE, TILE_SIZE))
+
     val predsRDD = preds.select("pe", "col", "row", "prediction")
       .as[(Extent, Int, Int, Double)].rdd
       .groupBy(_._1)
+
+    println(predsRDD.count())
 
     //creates an RDD with an array in it
     val arrRDD = predsRDD
@@ -113,16 +114,16 @@ object KMeans {
     /** This takes care of packing a tile. */
     val makeTile = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, TILE_SIZE, TILE_SIZE))
 
-    //The number of tiles in each direction. In this case, 30
-    val NUMBER_OF_TILES = 30
+    //The number of tiles in each direction.
 
-    val tl = TileLayout(NUMBER_OF_TILES, NUMBER_OF_TILES, TILE_SIZE, TILE_SIZE)
-    val layout = LayoutDefinition(tifExtent, tl)
+    val tl = TileLayout(15, 15, TILE_SIZE, TILE_SIZE)
+    val ge = GridExtent(tif._1.extent, 15.toDouble, 15.toDouble)
+    val layout = LayoutDefinition(ge, TILE_SIZE)
 
     //Assigns the tiles 2D indexes based on position relative to the larger extent
     def indexTile(pair: (Extent, Tile)): ((Int, Int), Tile) = {
       val gridBounds = layout.mapTransform(pair._1)
-      println(gridBounds)
+      //should it be rowMin?
       ((gridBounds.colMin, gridBounds.colMax), pair._2)
     }
 
@@ -130,10 +131,16 @@ object KMeans {
     val arrTile = arrRDD
       .map(makeTile)
       .map(indexTile)
+      .sortBy(value => value._1)
       .toLocalIterator
       .toSeq
 
+    for(i <- arrTile.indices)
+      println(arrTile.apply(i)._1)
+      println(arrTile.size)
+      println(arrTile.length)
     //Stitches the tiles together
+    //this is where everything goes wrong
     val stitchTile = TileLayoutStitcher.stitch[Tile](arrTile)
     println(stitchTile._1.cols)
     println(stitchTile._1.rows)
@@ -141,5 +148,6 @@ object KMeans {
     //val stitchTile = layout.mapTransform({???}: Extent)
 
     //arrTile.head._2.renderPng(ColorRamps.HeatmapBlueToYellowToRedSpectrum).write(s"//Users/jnachbar/Documents/Pictures/tileOne.png")
+
   }
 }
