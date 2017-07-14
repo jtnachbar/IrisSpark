@@ -30,8 +30,6 @@ import org.apache.spark.sql.types.{BinaryType, StructField, StructType}
 //6. Run K-Means
 //7. Reconstruct the image using your predefined index
 
-//to do:
-//try stitching together 15 * 15 empty tiles
 
 object KMeans {
 
@@ -65,11 +63,13 @@ object KMeans {
 
 
     //try three for columns and 23 for rows
-    val COL_SIZE = tif._2.cols/3
-    val ROW_SIZE = tif._2.rows/23
+    val COL_SIZE = 512
+    val ROW_SIZE = 512
 
 
-    def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath).split(COL_SIZE, ROW_SIZE)
+    def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath)
+      .split(COL_SIZE, ROW_SIZE)
+
 
     val blue: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF")
     val green: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B3.TIF")
@@ -122,14 +122,14 @@ object KMeans {
     val makeTile = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, COL_SIZE, ROW_SIZE))
 
     //this is a gridExtent stating that the
-    val ge = GridExtent(tif._1.extent, 3.toDouble, 23.toDouble)
+    val ge = GridExtent(tif._1.extent, 15.toDouble, 16.toDouble)
     val layout = LayoutDefinition(ge, COL_SIZE, ROW_SIZE)
 
     //Assigns the tiles 2D indexes based on position relative to the larger extent
     def indexTile(pair: (Extent, Tile)): ((Int, Int), Tile) = {
       val gridBounds = layout.mapTransform(pair._1)
       //should it be rowMin?
-      ((gridBounds.colMin, gridBounds.colMax), pair._2)
+      ((gridBounds.colMin/2, gridBounds.rowMin/2), pair._2)
     }
 
     //performs transformations before the stitcher
@@ -140,14 +140,38 @@ object KMeans {
       .toLocalIterator
       .toSeq
 
+    val emptyArr = Array.fill(512 * 512)(0)
+    val emptyTile: Tile = IntArrayTile(emptyArr, 512, 512)
     //try stitching together empty tiles
 
-    for(i <- arrTile.indices)
-      println(arrTile.apply(i)._1)
-      println(arrTile.length)
+    val emptySeq: Seq[((Int, Int), Tile)] = {
+      for(i <- 0 until 15; j <- 0 until 16)
+        yield ((i, j), emptyTile)
+    }
+    //figure this out please
+    def fillEmpty(seq: Seq[((Int, Int), Tile)]): Seq[((Int, Int), Tile)] = {
+      val empty = emptySeq
+      for {
+        //iterate through every position in the larger gridExtent
+        i: Int <- 0 until 15
+        j: Int <- 0 until 16
+        //if we're missing that tile, create it with empty data
+        //try to evaluate, and if IndexOutOfBounds set the index to emptyTile and return false
+        if (try { seq.apply(j * 15 + i)._1 == (i, j) } catch { case x: IndexOutOfBoundsException => false})
+        //or IndexOutOfBounds
+      } empty.patch(j * 15 + i, Seq(Seq.apply(j * 15 + i)), 1)
+      //else yield the correct index with the information
+      empty
+    }
+
+    val fillTile = fillEmpty(arrTile)
+
+    for(i <- 0 until fillTile.length)
+      println(fillTile.apply(i)._1)
+      println(fillTile.length)
     //Stitches the tiles together
     //this is where everything goes wrong
-    val stitchTile = TileLayoutStitcher.stitch[Tile](arrTile)
+    val stitchTile = TileLayoutStitcher.stitch[Tile](fillTile)
     println(stitchTile._1.cols)
     println(stitchTile._1.rows)
 
