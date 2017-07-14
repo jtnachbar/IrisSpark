@@ -30,8 +30,10 @@ import org.apache.spark.sql.types.{BinaryType, StructField, StructType}
 //6. Run K-Means
 //7. Reconstruct the image using your predefined index
 
+//to do:
+//try stitching together 15 * 15 empty tiles
+
 object KMeans {
-  val TILE_SIZE = 512
 
   //Making a tuple with all the info that I need
   def tilesToKeyPx(pe: ProjectedExtent, t1: (Tile), t2: (Tile), t3: (Tile)) = {
@@ -58,11 +60,16 @@ object KMeans {
 
     val sc = sparkSession.sparkContext
     // imports a TIF and then splits it
-    def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath).split(TILE_SIZE, TILE_SIZE)
 
     val tif = sc.hadoopGeoTiffRDD("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF").first()
-    println(math.ceil(tif._2.cols / TILE_SIZE))
-    println(math.ceil(tif._2.rows / TILE_SIZE))
+
+
+    //try three for columns and 23 for rows
+    val COL_SIZE = tif._2.cols/3
+    val ROW_SIZE = tif._2.rows/23
+
+
+    def splitTif(filePath: String): RDD[(ProjectedExtent, Tile)] = sc.hadoopGeoTiffRDD(filePath).split(COL_SIZE, ROW_SIZE)
 
     val blue: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B2.TIF")
     val green: RDD[(ProjectedExtent, Tile)] = splitTif("file:///Users/jnachbar/Downloads/LC80160342016111LGN00_B3.TIF")
@@ -99,7 +106,7 @@ object KMeans {
     //grabs what we need out of the dataFrame
     //somehow sort this to be in order
     //rows + columns - max
-    val distance = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, TILE_SIZE, TILE_SIZE))
+    val distance = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, COL_SIZE, ROW_SIZE))
 
     val predsRDD = preds.select("pe", "col", "row", "prediction")
       .as[(Extent, Int, Int, Double)].rdd
@@ -112,13 +119,11 @@ object KMeans {
       .map(value => (value._1, iterArray(value._2.toSeq)))
 
     /** This takes care of packing a tile. */
-    val makeTile = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, TILE_SIZE, TILE_SIZE))
+    val makeTile = (pair: (Extent, Array[Double])) => (pair._1, ArrayTile(pair._2, COL_SIZE, ROW_SIZE))
 
-    //The number of tiles in each direction.
-
-    val tl = TileLayout(15, 15, TILE_SIZE, TILE_SIZE)
-    val ge = GridExtent(tif._1.extent, 15.toDouble, 15.toDouble)
-    val layout = LayoutDefinition(ge, TILE_SIZE)
+    //this is a gridExtent stating that the
+    val ge = GridExtent(tif._1.extent, 3.toDouble, 23.toDouble)
+    val layout = LayoutDefinition(ge, COL_SIZE, ROW_SIZE)
 
     //Assigns the tiles 2D indexes based on position relative to the larger extent
     def indexTile(pair: (Extent, Tile)): ((Int, Int), Tile) = {
@@ -135,9 +140,10 @@ object KMeans {
       .toLocalIterator
       .toSeq
 
+    //try stitching together empty tiles
+
     for(i <- arrTile.indices)
       println(arrTile.apply(i)._1)
-      println(arrTile.size)
       println(arrTile.length)
     //Stitches the tiles together
     //this is where everything goes wrong
